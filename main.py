@@ -250,7 +250,7 @@ def get_signals():
 
 
 @app.post("/chat")
-async def chat(payload: ChatPayload):
+def chat(payload: ChatPayload):
     try:
         system   = build_system_prompt(payload.signals)
         response = call_llm(system, payload.history, payload.message)
