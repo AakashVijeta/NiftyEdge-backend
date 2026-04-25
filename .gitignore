@@ -7,3 +7,24 @@ __pycache__/
 *.pyc
 get-pip.py
 .env
+
+# Claude Code local config
+.claude/
+CLAUDE.md
+
+# Generated knowledge graph
+graphify-out/
+
+# Jupyter
+notebooks/
+*.ipynb
+
+# Python artifacts
+*.egg-info/
+dist/
+build/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
