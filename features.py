@@ -50,26 +50,24 @@ def compute_rsi(x):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def compute_macd(x):
-    ema12 = x.ewm(span=12).mean()
-    ema26 = x.ewm(span=26).mean()
-    return ema12 - ema26
+def _add_macd_cols(group: pd.DataFrame) -> pd.DataFrame:
+    close = group["Close"]
+    ema12 = close.ewm(span=12).mean()
+    ema26 = close.ewm(span=26).mean()
+    macd  = ema12 - ema26
+    group = group.copy()
+    group["MACD"]   = macd
+    group["Signal"] = macd.ewm(span=9).mean()
+    return group
 
-def compute_signal(x):
-    ema12 = x.ewm(span=12).mean()
-    ema26 = x.ewm(span=26).mean()
-    macd = ema12 - ema26
-    return macd.ewm(span=9).mean()
-
-def compute_bb_upper(x):
-    ma20 = x.rolling(20).mean()
-    std = x.rolling(20).std()
-    return ma20 + (2 * std)
-
-def compute_bb_lower(x):
-    ma20 = x.rolling(20).mean()
-    std = x.rolling(20).std()
-    return ma20 - (2 * std)
+def _add_bb_cols(group: pd.DataFrame) -> pd.DataFrame:
+    close = group["Close"]
+    ma20  = close.rolling(20).mean()
+    std   = close.rolling(20).std()
+    group = group.copy()
+    group["BB_Upper"] = ma20 + 2 * std
+    group["BB_Lower"] = ma20 - 2 * std
+    return group
 
 def calculate_target(group):
     close = group['Close'].values
@@ -117,13 +115,11 @@ def build_features(df, nsei_df):
     # RSI
     df["RSI"] = df.groupby("Ticker")["Close"].transform(compute_rsi)
 
-    # MACD and Signal
-    df["MACD"]   = df.groupby("Ticker")["Close"].transform(compute_macd)
-    df["Signal"] = df.groupby("Ticker")["Close"].transform(compute_signal)
+    # MACD and Signal (single pass over EMA12/EMA26)
+    df = df.groupby("Ticker", group_keys=False).apply(_add_macd_cols)
 
-    # Bollinger Bands
-    df["BB_Upper"] = df.groupby("Ticker")["Close"].transform(compute_bb_upper)
-    df["BB_Lower"] = df.groupby("Ticker")["Close"].transform(compute_bb_lower)
+    # Bollinger Bands (single pass over rolling mean/std)
+    df = df.groupby("Ticker", group_keys=False).apply(_add_bb_cols)
     df["BB_Position"] = (df["Close"] - df["BB_Lower"]) / (df["BB_Upper"] - df["BB_Lower"])
 
     # Volume ratio

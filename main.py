@@ -1,5 +1,8 @@
 import os
+import time
 import logging
+import threading
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -16,7 +19,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ── Startup ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="NiftyEdge API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    t = threading.Thread(target=_warmup_cache, daemon=True)
+    t.start()
+    yield
+
+app = FastAPI(title="NiftyEdge API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,19 +37,24 @@ app.add_middleware(
 
 model = joblib.load("models/model_v1.pkl")
 
-THRESHOLD = 0.55
-TICKERS   = list(SECTOR_MAP.keys())
-NSEI      = "^NSEI"
+THRESHOLD  = 0.55
+TICKERS    = list(SECTOR_MAP.keys())
+NSEI       = "^NSEI"
 
 load_dotenv()
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+CACHE_TTL          = int(os.getenv("SIGNALS_CACHE_TTL", 900))  # seconds; default 15 min
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 openrouter_client = OpenAI(
     api_key=OPENROUTER_API_KEY,
     base_url="https://openrouter.ai/api/v1",
 )
+
+_cache_lock       = threading.Lock()
+_signals_cache: dict = {"data": None, "ts": 0.0}
+_refresh_running  = False
 
 # ── Request schema ────────────────────────────────────────────────────────────
 class ChatPayload(BaseModel):
@@ -53,13 +67,13 @@ def fetch_recent_data(lookback_days: int = 120):
     end   = datetime.today()
     start = end - timedelta(days=lookback_days)
 
-    raw = yf.download(TICKERS, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), group_by="ticker")
+    raw = yf.download(TICKERS, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), group_by="ticker", progress=False, threads=True)
     raw = raw.swaplevel(axis=1).stack(level=1).reset_index()
     raw.columns.name = None
     raw.rename(columns={"level_1": "Ticker"}, inplace=True)
     raw["Date"] = pd.to_datetime(raw["Date"])
 
-    nsei_raw = yf.download(NSEI, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"))
+    nsei_raw = yf.download(NSEI, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), progress=False)
     nsei_raw.columns = [col[0] for col in nsei_raw.columns]
     nsei_raw = nsei_raw.reset_index()[["Date", "Close"]]
     nsei_raw["Date"] = pd.to_datetime(nsei_raw["Date"])
@@ -199,51 +213,108 @@ def call_llm(system: str, history: list, message: str) -> str:
         raise RuntimeError("Both LLM providers unavailable.") from e2
 
 
+def _compute_signals() -> list | None:
+    """Fetch data, build features, run model. Returns signal list or None on data failure."""
+    raw, nsei_raw = fetch_recent_data()
+    if raw.empty:
+        return None
+
+    raw    = raw.sort_values(["Ticker", "Date"]).reset_index(drop=True)
+    df     = build_features(raw, nsei_raw)
+    latest = df.sort_values("Date").groupby("Ticker").tail(1).copy()
+    latest = latest.dropna(subset=FEATURES)
+
+    if latest.empty:
+        return []
+
+    X      = latest[FEATURES].values
+    probas = model.predict_proba(X)[:, 1]
+    latest["probability"] = probas
+
+    signals = latest[latest["probability"] >= THRESHOLD].copy()
+    signals["sector"] = signals["Ticker"].map(SECTOR_MAP)
+    signals = signals.sort_values("probability", ascending=False)
+
+    return [
+        {
+            "ticker":          row["Ticker"],
+            "date":            row["Date"].strftime("%Y-%m-%d"),
+            "probability":     round(float(row["probability"]), 3),
+            "sector":          row["sector"],
+            "rsi":             round(float(row["RSI"]), 2)             if pd.notna(row.get("RSI"))             else None,
+            "volume_ratio":    round(float(row["Volume_Ratio"]), 3)    if pd.notna(row.get("Volume_Ratio"))    else None,
+            "bb_position":     round(float(row["BB_Position"]), 3)     if pd.notna(row.get("BB_Position"))     else None,
+            "sector_momentum": round(float(row["Sector_Momentum"]), 4) if pd.notna(row.get("Sector_Momentum")) else None,
+            "rs_vs_nifty":     round(float(row["RS_vs_Nifty"]), 2)     if pd.notna(row.get("RS_vs_Nifty"))     else None,
+        }
+        for _, row in signals.iterrows()
+    ]
+
+
+def _warmup_cache():
+    global _refresh_running
+    try:
+        log.info("Refreshing signals cache…")
+        result = _compute_signals()
+        if result is not None:
+            with _cache_lock:
+                _signals_cache["data"] = result
+                _signals_cache["ts"]   = time.time()
+            log.info(f"Signals cache refreshed: {len(result)} signal(s)")
+        else:
+            log.warning("Refresh: no market data returned")
+    except Exception as e:
+        log.warning(f"Cache refresh failed: {e}")
+    finally:
+        with _cache_lock:
+            _refresh_running = False
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
+def _trigger_background_refresh():
+    global _refresh_running
+    with _cache_lock:
+        if _refresh_running:
+            return
+        _refresh_running = True
+    threading.Thread(target=_warmup_cache, daemon=True).start()
+
+
 @app.get("/signals")
 def get_signals():
     try:
-        raw, nsei_raw = fetch_recent_data()
+        now = time.time()
+        with _cache_lock:
+            cached_data = _signals_cache["data"]
+            cache_age   = now - _signals_cache["ts"]
 
-        if raw.empty:
+        if cached_data is not None:
+            if cache_age < CACHE_TTL:
+                log.info("Returning cached signals")
+            else:
+                log.info("Cache stale — returning stale data, refreshing in background")
+                _trigger_background_refresh()
+            return cached_data
+
+        # Cache empty: block on first compute
+        log.info("Cache empty — computing signals synchronously")
+        result = _compute_signals()
+        if result is None:
             raise HTTPException(status_code=503, detail="Failed to fetch market data")
 
-        raw    = raw.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-        df     = build_features(raw, nsei_raw)
-        latest = df.sort_values("Date").groupby("Ticker").tail(1).copy()
-        latest = latest.dropna(subset=FEATURES)
+        with _cache_lock:
+            _signals_cache["data"] = result
+            _signals_cache["ts"]   = time.time()
 
-        if latest.empty:
-            return []
+        return result
 
-        X      = latest[FEATURES].values
-        probas = model.predict_proba(X)[:, 1]
-        latest["probability"] = probas
-
-        signals = latest[latest["probability"] >= THRESHOLD].copy()
-        signals["sector"] = signals["Ticker"].map(SECTOR_MAP)
-        signals = signals.sort_values("probability", ascending=False)
-
-        return [
-            {
-                "ticker":          row["Ticker"],
-                "date":            row["Date"].strftime("%Y-%m-%d"),
-                "probability":     round(float(row["probability"]), 3),
-                "sector":          row["sector"],
-                "rsi":             round(float(row["RSI"]), 2)             if pd.notna(row.get("RSI"))             else None,
-                "volume_ratio":    round(float(row["Volume_Ratio"]), 3)    if pd.notna(row.get("Volume_Ratio"))    else None,
-                "bb_position":     round(float(row["BB_Position"]), 3)     if pd.notna(row.get("BB_Position"))     else None,
-                "sector_momentum": round(float(row["Sector_Momentum"]), 4) if pd.notna(row.get("Sector_Momentum")) else None,
-                "rs_vs_nifty":     round(float(row["RS_vs_Nifty"]), 2)     if pd.notna(row.get("RS_vs_Nifty"))     else None,
-            }
-            for _, row in signals.iterrows()
-        ]
-
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception("Error in /signals")
         raise HTTPException(status_code=500, detail=str(e))
