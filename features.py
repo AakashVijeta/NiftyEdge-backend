@@ -115,11 +115,17 @@ def build_features(df, nsei_df):
     # RSI
     df["RSI"] = df.groupby("Ticker")["Close"].transform(compute_rsi)
 
-    # MACD and Signal (single pass over EMA12/EMA26)
-    df = df.groupby("Ticker", group_keys=False).apply(_add_macd_cols)
+    # MACD and Signal
+    df["MACD"] = df.groupby("Ticker")["Close"].transform(
+        lambda x: x.ewm(span=12).mean() - x.ewm(span=26).mean()
+    )
+    df["Signal"] = df.groupby("Ticker")["MACD"].transform(lambda x: x.ewm(span=9).mean())
 
-    # Bollinger Bands (single pass over rolling mean/std)
-    df = df.groupby("Ticker", group_keys=False).apply(_add_bb_cols)
+    # Bollinger Bands
+    _ma20 = df.groupby("Ticker")["Close"].transform(lambda x: x.rolling(20).mean())
+    _std20 = df.groupby("Ticker")["Close"].transform(lambda x: x.rolling(20).std())
+    df["BB_Upper"] = _ma20 + 2 * _std20
+    df["BB_Lower"] = _ma20 - 2 * _std20
     df["BB_Position"] = (df["Close"] - df["BB_Lower"]) / (df["BB_Upper"] - df["BB_Lower"])
 
     # Volume ratio
