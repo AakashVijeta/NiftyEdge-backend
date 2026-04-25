@@ -15,4 +15,7 @@ jobs:
           BACKEND_URL: ${{ vars.BACKEND_URL || 'https://niftyedge-backend.onrender.com' }}
         run: |
           echo "Pinging $BACKEND_URL/health"
-          curl --fail --silent --show-error --max-time 60 "$BACKEND_URL/health" || exit 1
+          curl --fail --silent --show-error \
+            --connect-timeout 30 --max-time 180 \
+            --retry 3 --retry-delay 15 --retry-all-errors \
+            "$BACKEND_URL/health"
