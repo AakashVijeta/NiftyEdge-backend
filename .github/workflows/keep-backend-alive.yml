@@ -2,8 +2,9 @@ name: Keep Backend Alive
 
 on:
   schedule:
-    # Every 10 minutes. Render free tier spins down after ~15 min idle.
-    - cron: "*/10 * * * *"
+    # Every 5 minutes. Render free tier spins down after ~15 min idle.
+    # GitHub cron can lag 15-30 min under load, so ping frequently.
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -15,7 +16,8 @@ jobs:
           BACKEND_URL: ${{ vars.BACKEND_URL || 'https://niftyedge-backend.onrender.com' }}
         run: |
           echo "Pinging $BACKEND_URL/health"
-          curl --fail --silent --show-error \
+          curl --silent --show-error \
             --connect-timeout 30 --max-time 180 \
             --retry 3 --retry-delay 15 --retry-all-errors \
             "$BACKEND_URL/health"
+          echo "Ping complete (exit $?)"
