@@ -3,7 +3,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com/)
 [![XGBoost](https://img.shields.io/badge/XGBoost-EB602A?style=for-the-badge&logo=xgboost&logoColor=white)](https://xgboost.ai/)
 [![Groq](https://img.shields.io/badge/Groq-f3f3f3?style=for-the-badge&logo=groq&logoColor=black)](https://groq.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+
 
 **NiftyEdge API** is a high-performance, machine-learning powered backend engine designed for swing trading discovery in the Nifty 50 universe. It leverages an XGBoost classifier to predict short-term bullish breakouts and integrates an LLM-based "AI Analyst" to provide qualitative context on trade setups.
 
